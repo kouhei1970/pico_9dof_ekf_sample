@@ -1,2 +1,4 @@
 # 9DOFセンサとRaspberry Pi Picoを用いたクォータニオンを用いた拡張カルマンフィルタによる姿勢とジャイロバイアスの推定
 An Extended Kalman Filter sample for Quaternion-Based Orientation Estimation Using 9DOF Sensors and Raspberry Pi Pico
+
+Raspberry Pi Pico とLSM9DS1を用いた拡張カルマンフィルタによるクォータニオンとジャイロバイアスの推定をするコードを置いておきます。姿勢の推定については遅れやオーバーシュートの改善など見直し中。ジャイロバイアスの推定はまだ十分に検証できていません。（2021/10/14時点）
