@@ -9,9 +9,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(PICO_EXAMPLES_PATH ${PROJECT_SOURCE_DIR})
 
 pico_sdk_init()
+include_directories(/Users/itoukouhei/pico/eigen)
 
 add_executable(ekf_quaternion_estimate
   ekf_quaternion_estimate.cpp
+  sensor.cpp
+  ekf.cpp
   lsm9ds1_reg.c
 )
 target_link_libraries(ekf_quaternion_estimate hardware_spi pico_stdlib)

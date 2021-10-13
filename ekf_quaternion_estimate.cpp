@@ -1,163 +1,157 @@
-/* Includes ------------------------------------------------------------------*/
 #include <string.h>
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
 #include "hardware/spi.h"
-#include "lsm9ds1_reg.h"
+#include "sensor.hpp"
+#include "ekf.hpp"
+#include <math.h>
 
-static int16_t data_raw_acceleration[3];
-static int16_t data_raw_angular_rate[3];
-static int16_t data_raw_magnetic_field[3];
-static float acceleration_mg[3];
-static float angular_rate_mdps[3];
-static float magnetic_field_mgauss[3];
-static lsm9ds1_id_t whoamI;
-static lsm9ds1_status_t reg;
-static uint8_t rst;
-static uint8_t tx_buffer_imu[1000];
-static uint8_t tx_buffer_mag[1000];
+//#define GRAV (9.80665)
 
-#define PIN_CSAG  1
-#define PIN_MISO  4
-#define PIN_CSM   5
-#define PIN_SCK   6
-#define PIN_MOSI  7
-
-sensbus_t Ins_bus={spi0, PIN_CSAG};
-sensbus_t Mag_bus={spi0, PIN_CSM};
-
-stmdev_ctx_t Imu_h;
-stmdev_ctx_t Mag_h;
-
-void imu_mag_init(void)
+bool callback(repeating_timer_t *rt)
 {
+  static double elapsed_time=0.0;
+  static float dt=0.01;
+  static float ax,ay,az;
+  static float wp,wq,wr;
+  static float mx,my,mz,mx0,my0,mz0,mx1,my1,mz1,q0b,q1b,q2b,q3b;
+  static float mag_norm;
+  static uint64_t s_time=0,e_time=0,s_time2=0,e_time2=0,d_time;
 
-  /* Initialize platform specific hardware */
-  platform_init(  &Ins_bus,/* INS spi bus & cs pin */
-                  &Mag_bus,/* MAG spi bus & cs pin */ 
-                  &Imu_h,  /* IMU Handle */
-                  &Mag_h,  /* MAG Handle */
-                  50*1000, /* SPI Frequency */
-                  PIN_MISO,/* MISO Pin number */ 
-                  PIN_SCK, /* SCK  Pin number */ 
-                  PIN_MOSI,/* MOSI Pin number */ 
-                  PIN_CSAG,/* CSAG Pin number */ 
-                  PIN_CSM  /* CSM  Pin number */ 
-  );
+  static Matrix<float, 7 ,1> xp = MatrixXf::Zero(7,1);
+  static Matrix<float, 7 ,1> xe = MatrixXf::Zero(7,1);
+  static Matrix<float, 7 ,7> P = MatrixXf::Identity(7,7);
+  static Matrix<float, 6 ,1> z = MatrixXf::Zero(6,1);
+  static Matrix<float, 3, 1> omega_m = MatrixXf::Zero(3, 1);
+  static Matrix<float, 3, 1> domega;
+  static Matrix<float, 3, 3> Q;// = MatrixXf::Identity(3, 3)*0.1;
+  static Matrix<float, 6, 6> R;// = MatrixXf::Identity(6, 6)*0.0001;
+  static Matrix<float, 7 ,3> G;
+  static Matrix<float, 3 ,1> beta;
 
-  /* Wait sensor boot time */
-  platform_delay(BOOT_TIME);
-  sleep_ms(1000);
+  static int flag=0;
 
-  /* Check device ID */
-  lsm9ds1_dev_id_get(&Mag_h, &Imu_h, &whoamI);
+  
+  s_time=time_us_64();
+  //Variable Initalize
+  if (flag==0)
+  {
+    flag=1;
+    xe << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+    xp =xe;
+    Q <<  1.0e0  , 0.0    , 0.0,
+          0.0    , 1.0e0  , 0.0,
+          0.0,     0.0    , 1.0e0;
 
-  if (whoamI.imu != LSM9DS1_IMU_ID || whoamI.mag != LSM9DS1_MAG_ID) {
-    while (1) {
-      /* manage here device not found */
-      printf("Device not found !\n");
-      sleep_ms(1000);
+    R <<  8.17e-6, 0.0    , 0.0    , 0.0, 0.0, 0.0,
+          0.0    , 6.25e-6, 0.0    , 0.0, 0.0, 0.0,
+          0.0    , 0.0    , 1.19e-5, 0.0, 0.0, 0.0,
+          0.0    , 0.0    , 0.0    , 2.03e-4, 0.0    , 0.0,
+          0.0    , 0.0    , 0.0    , 0.0    , 2.08e-4, 0.0,
+          0.0    , 0.0    , 0.0    , 0.0    , 0.0    , 3.29e-4;
+    
+    G <<  0.0,0.0,0.0, 
+          0.0,0.0,0.0, 
+          0.0,0.0,0.0, 
+          0.0,0.0,0.0, 
+          1.0,0.0,0.0, 
+          0.0,1.0,0.0, 
+          0.0,0.0,1.0;
+    beta << 0.003, 0.003, 0.003;
+    P <<  1,0,0,0,0,0,0,  
+          0,1,0,0,0,0,0,
+          0,0,1,0,0,0,0,  
+          0,0,0,1,0,0,0, 
+          0,0,0,0,1,0,0,  
+          0,0,0,0,0,1,0,  
+          0,0,0,0,0,0,1;
+  }
+  if (flag==1)
+  {
+    if (elapsed_time>10.0)
+    {
+      flag=2;
+      q0b=xe(0,0)-1.0;
+      q1b=xe(1,0);
+      q2b=xe(2,0);
+      q3b=xe(3,0);
     }
   }
+  //Raad 9DOF sensor
+  imu_mag_data_read();
+  ax =-acceleration_mg[0]*GRAV*0.001;
+  ay =-acceleration_mg[1]*GRAV*0.001;
+  az = acceleration_mg[2]*GRAV*0.001;
+  wp = angular_rate_mdps[0]*M_PI*5.55555555e-6;//5.5.....e-6=1/180/1000
+  wq = angular_rate_mdps[1]*M_PI*5.55555555e-6;
+  wr =-angular_rate_mdps[2]*M_PI*5.55555555e-6;
+  mx0 =-magnetic_field_mgauss[0];
+  my0 = magnetic_field_mgauss[1];
+  mz0 =-magnetic_field_mgauss[2];
 
-  /* Restore default configuration */
-  lsm9ds1_dev_reset_set(&Mag_h, &Imu_h, PROPERTY_ENABLE);
+/*地磁気校正データ
+  地磁気の回転行列
+  [[ 0.7476018   0.49847825  0.43887467]
+   [-0.58069715  0.81129925  0.06770773]
+   [-0.32230786 -0.3054717   0.89599369]]
+  中心座標
+  -112.81022304592778 65.47692484225598 -174.3009521339447
+  拡大係数
+  0.0031687151914840095 0.0035509799555226906 0.003019055826773856
+*/
 
-  do {
-    lsm9ds1_dev_reset_get(&Mag_h, &Imu_h, &rst);
-  } while (rst);
+  mx1 = 0.0031687151914840095*( 0.74760180*mx0 +0.49847825*my0 +0.43887467*mz0 +112.81022304592778);
+  my1 = 0.0035509799555226906*(-0.58069715*mx0 +0.81129925*my0 +0.06770773*mz0 - 65.47692484225598 );
+  mz1 = 0.003019055826773856*(-0.32230786*mx0 -0.30547170*my0 +0.89599369*mz0 +174.3009521339447);
+  mx = 0.74760180*mx1 -0.58069715*my1 -0.32230786*mz1;
+  my = 0.49847825*mx1 +0.81129925*my1 -0.30547170*mz1;
+  mz = 0.43887467*mx1 +0.06770773*my1 +0.89599369*mz1; 
+  mag_norm=sqrt(mx*mx +my*my +mz*mz);
 
-  /* Enable Block Data Update */
-  lsm9ds1_block_data_update_set(&Mag_h, &Imu_h,
-                                PROPERTY_ENABLE);
-  /* Set full scale */
-  lsm9ds1_xl_full_scale_set(&Imu_h, LSM9DS1_4g);
-  lsm9ds1_gy_full_scale_set(&Imu_h, LSM9DS1_2000dps);
-  lsm9ds1_mag_full_scale_set(&Mag_h, LSM9DS1_16Ga);
-
-  /* Configure filtering chain - See datasheet for filtering chain details */
-
-  /* Accelerometer filtering chain */
-  lsm9ds1_xl_filter_aalias_bandwidth_set(&Imu_h, LSM9DS1_AUTO);
-  lsm9ds1_xl_filter_lp_bandwidth_set(&Imu_h,
-                                     LSM9DS1_LP_ODR_DIV_50);
-  lsm9ds1_xl_filter_out_path_set(&Imu_h, LSM9DS1_LP_OUT);
-
-  /* Gyroscope filtering chain */
-  lsm9ds1_gy_filter_lp_bandwidth_set(&Imu_h,
-                                     LSM9DS1_LP_ULTRA_LIGHT);
-  lsm9ds1_gy_filter_hp_bandwidth_set(&Imu_h, LSM9DS1_HP_MEDIUM);
-  lsm9ds1_gy_filter_out_path_set(&Imu_h,
-                                 LSM9DS1_LPF1_HPF_LPF2_OUT);
-
-  /* Set Output Data Rate / Power mode */
-  lsm9ds1_imu_data_rate_set(&Imu_h, LSM9DS1_IMU_476Hz);
-  lsm9ds1_mag_data_rate_set(&Mag_h, LSM9DS1_MAG_MP_560Hz);
-}
-
-void imu_mag_data_read(void)
-{
-  /* Read device status register */
-  lsm9ds1_dev_status_get(&Mag_h, &Imu_h, &reg);
-
-  if ( reg.status_imu.xlda && reg.status_imu.gda ) {
-    /* Read imu data */
-    memset(data_raw_acceleration, 0x00, 3 * sizeof(int16_t));
-    memset(data_raw_angular_rate, 0x00, 3 * sizeof(int16_t));
-    lsm9ds1_acceleration_raw_get(&Imu_h,
-                                 data_raw_acceleration);
-    lsm9ds1_angular_rate_raw_get(&Imu_h,
-                                 data_raw_angular_rate);
-    acceleration_mg[0] = lsm9ds1_from_fs4g_to_mg(
-                           data_raw_acceleration[0]);
-    acceleration_mg[1] = lsm9ds1_from_fs4g_to_mg(
-                           data_raw_acceleration[1]);
-    acceleration_mg[2] = lsm9ds1_from_fs4g_to_mg(
-                           data_raw_acceleration[2]);
-    angular_rate_mdps[0] = lsm9ds1_from_fs2000dps_to_mdps(
-                             data_raw_angular_rate[0]);
-    angular_rate_mdps[1] = lsm9ds1_from_fs2000dps_to_mdps(
-                             data_raw_angular_rate[1]);
-    angular_rate_mdps[2] = lsm9ds1_from_fs2000dps_to_mdps(
-                             data_raw_angular_rate[2]);
-  }
-
-  if ( reg.status_mag.zyxda ) {
-    /* Read magnetometer data */
-    memset(data_raw_magnetic_field, 0x00, 3 * sizeof(int16_t));
-    lsm9ds1_magnetic_raw_get(&Mag_h, data_raw_magnetic_field);
-    magnetic_field_mgauss[0] = lsm9ds1_from_fs16gauss_to_mG(
-                                 data_raw_magnetic_field[0]);
-    magnetic_field_mgauss[1] = lsm9ds1_from_fs16gauss_to_mG(
-                                 data_raw_magnetic_field[1]);
-    magnetic_field_mgauss[2] = lsm9ds1_from_fs16gauss_to_mG(
-                                 data_raw_magnetic_field[2]);
-  }
   
-
-
+  //Kalman Filter
+  omega_m << wp, wq, wr;
+  z << ax, ay, az, mx, my, mz;
+  ekf(xp, xe, P, z, omega_m, Q, R, G*dt, beta, dt);
+  e_time=time_us_64();
+  
+  //Output Data
+  s_time2=time_us_64();  
+  printf("%9.3f %9.5f %9.5f %9.5f %9.5f %9.6f %9.6f %9.6f %6llu %6llu %9.3f %9.3f %9.3f %11.8f %11.8f %11.8f %9.3f %9.3f %9.3f %9.3f \n"
+            ,elapsed_time,//1
+            xe(0,0), xe(1,0), xe(2,0), xe(3,0),//2~5 
+            xe(4,0), xe(5,0),xe(6,0),//6~8
+            e_time-s_time,//9
+            d_time,//10
+            ax, ay, az,//11~13
+            wp, wq, wr,//14~16
+            mx, my, mz,//17~19
+            mag_norm); //20
+  elapsed_time = elapsed_time + 0.01;
+  e_time2=time_us_64();
+  d_time=e_time2-s_time2;
+  return ( true );
 }
-
 
 int main(void)
 {
-
+  static repeating_timer_t timer;
+  int start_wait=10;
   stdio_init_all();
   imu_mag_init();
-  while(1)
+
+  while(start_wait)
   {
-    imu_mag_data_read();
-    sprintf((char *)tx_buffer_imu,
-            "IMU-[mg]:\t%4.2f\t%4.2f\t%4.2f\t[mdps]:\t%4.2f\t%4.2f\t%4.2f\t",
-            acceleration_mg[0], acceleration_mg[1], acceleration_mg[2],
-            angular_rate_mdps[0], angular_rate_mdps[1], angular_rate_mdps[2]);
-    sprintf((char *)tx_buffer_mag, "MAG-[mG]:\t%4.2f\t%4.2f\t%4.2f\r\n",
-            magnetic_field_mgauss[0], magnetic_field_mgauss[1],
-            magnetic_field_mgauss[2]);
-    tx_com(tx_buffer_imu, strlen((char const *)tx_buffer_imu));
-    tx_com(tx_buffer_mag, strlen((char const *)tx_buffer_mag));
-    sleep_ms(10);
+    start_wait--;
+    printf("#Please wait %d[s]\n",start_wait); 
+    sleep_ms(1000);
   }
+
+  /* インターバルタイマ設定 */
+  add_repeating_timer_us( -10000, &callback, NULL, &timer );
+  
+  while(1);
+
   return 0;
 }
